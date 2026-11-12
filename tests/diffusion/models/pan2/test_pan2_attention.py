@@ -22,6 +22,7 @@ def test_output_projections_receive_contiguous_inputs(env, batch):
     tmp, od_config, vllm_config = env
     state = random_checkpoint(tmp / "m")
     od_config.model = str(tmp / "m")
+    od_config.model_config = {"pan2_host_modulation": False}
     model = PAN2Transformer3DModel(od_config=od_config, **TINY).eval()
     model.load_weights(list(state.items()))
 

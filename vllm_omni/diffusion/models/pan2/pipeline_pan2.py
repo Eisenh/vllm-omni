@@ -817,6 +817,8 @@ class PAN2Pipeline(
         self.scheduler.set_timesteps(sigmas=sigmas, device=device)
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
+        # Host modulation: one CPU pass over the modulation weights for the whole schedule (cached across requests).
+        self.transformer.prefetch_host_modulation(timesteps)
 
         with self._resident_dit_layers_on_device(), self.progress_bar(total=len(timesteps)) as pbar:
             for t in timesteps:

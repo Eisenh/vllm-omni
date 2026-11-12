@@ -31,6 +31,16 @@ from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.flux.flux_transformer import FeedForward
+from vllm_omni.diffusion.models.pan2.host_modulation import (
+    HOST_MODULATION_CACHE_MB_KEY,
+    HOST_MODULATION_THREADS_KEY,
+    PAN2HostModulation,
+    host_modulation_enabled,
+    is_host_modulation_weight,
+    resolve_transformer_dir,
+)
+from vllm_omni.diffusion.offloader.config import offload_streams_blocks
+from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -39,6 +49,16 @@ if TYPE_CHECKING:
 # Fuse the video Q/K RMSNorm + RoPE only when a call covers at least this many tokens; below it the host launch
 # overhead dominates. Override with VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS (0 = always fuse).
 _FUSED_MIN_TOKENS = 2048
+
+
+def _accelerator_memory() -> int | None:
+    """Total memory of this worker's accelerator in bytes, or None when there is none or it cannot be queried."""
+    if not current_omni_platform.is_cuda_alike():
+        return None
+    try:
+        return int(current_omni_platform.get_device_total_memory(torch.accelerator.current_device_index()))
+    except (NotImplementedError, RuntimeError):
+        return None
 
 
 class PAN2RotaryPosEmbed(nn.Module):
@@ -138,6 +158,25 @@ class PAN2TokenRefinerBlock(nn.Module):
         hidden_states = hidden_states + self.attn(self.norm1(hidden_states))
         hidden_states = hidden_states + self.ff(self.norm2(hidden_states))
         return hidden_states
+
+
+class PAN2ModulationNorm(nn.Module):
+    """``AdaLayerNormZero`` without its modulation linear: it takes the precomputed modulation ``[B, 6 * dim]``.
+
+    Used with host modulation (``model_config.pan2_host_modulation``), where ``PAN2HostModulation`` computes
+    ``norm1.linear(silu(temb))`` off the accelerator. The chunking and the LayerNorm match ``AdaLayerNormZero``.
+    """
+
+    def __init__(self, embedding_dim: int) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
+
+    def forward(
+        self, x: torch.Tensor, emb: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
+        x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
 
 class PAN2Attention(nn.Module):
@@ -305,11 +344,21 @@ class PAN2TransformerBlock(nn.Module):
         eps: float = 1e-6,
         quant_config: "QuantizationConfig | None" = None,
         prefix: str = "",
+        host_modulation_index: int | None = None,
     ):
         super().__init__()
-        # The modulation runs in float32 and is not quantized.
-        self.norm1 = AdaLayerNormZero(dim, quant_config=None, prefix=f"{prefix}.norm1")
-        self.norm1.linear.float()
+        self.host_modulation = host_modulation_index is not None
+        if self.host_modulation:
+            # ``temb`` is the [B, num_blocks, 6 * dim] table of all blocks; a tensor index (not a Python int) keeps
+            # the repeated blocks one compiled region.
+            self.norm1 = PAN2ModulationNorm(dim)
+            self.register_buffer(
+                "_host_modulation_index", torch.tensor([host_modulation_index], dtype=torch.long), persistent=False
+            )
+        else:
+            # The modulation runs in float32 and is not quantized.
+            self.norm1 = AdaLayerNormZero(dim, quant_config=None, prefix=f"{prefix}.norm1")
+            self.norm1.linear.float()
         self.norm1_context = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.scale_shift_table_context = nn.Parameter(torch.zeros(6 * dim, dtype=torch.float32))
 
@@ -332,6 +381,8 @@ class PAN2TransformerBlock(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
         hidden_states_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.host_modulation:
+            temb = temb.index_select(1, self._host_modulation_index).squeeze(1)
         # The norms, their shift/scale and the gated residuals run in float32, like the modulation.
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states.float(), emb=temb)
         norm_hidden_states = norm_hidden_states.type_as(hidden_states)
@@ -440,6 +491,24 @@ class PAN2Transformer3DModel(nn.Module):
         )
         self.context_type_embedding = nn.Parameter(torch.zeros(inner_dim))
 
+        # Host modulation: keep the 44 FP32 norm1.linear (17.7 GB, replicated under TP) off the accelerator.
+        self.host_modulation: PAN2HostModulation | None = None
+        if host_modulation_enabled(
+            od_config,
+            num_blocks=num_layers,
+            dim=inner_dim,
+            device_memory=_accelerator_memory(),
+            streams_blocks=offload_streams_blocks(od_config),
+        ):
+            model_config = od_config.model_config or {}
+            self.host_modulation = PAN2HostModulation(
+                transformer_dir=resolve_transformer_dir(od_config.model, getattr(od_config, "revision", None)),
+                num_blocks=num_layers,
+                dim=inner_dim,
+                cache_mb=int(model_config.get(HOST_MODULATION_CACHE_MB_KEY, 2048)),
+                num_threads=model_config.get(HOST_MODULATION_THREADS_KEY),
+            )
+
         self.transformer_blocks = nn.ModuleList(
             [
                 PAN2TransformerBlock(
@@ -450,6 +519,7 @@ class PAN2Transformer3DModel(nn.Module):
                     context_mlp_ratio,
                     quant_config=quant_config,
                     prefix=f"transformer_blocks.{i}",
+                    host_modulation_index=i if self.host_modulation is not None else None,
                 )
                 for i in range(num_layers)
             ]
@@ -476,6 +546,18 @@ class PAN2Transformer3DModel(nn.Module):
         )
         hidden_states_mask[:, ctx.sp_original_seq_len :] = False
         return hidden_states_mask
+
+    def _time_embedding(self, timestep: torch.Tensor) -> torch.Tensor:
+        timesteps_proj = self.time_proj(timestep).to(self.time_embedder.linear_1.weight.dtype)
+        return self.time_embedder(timesteps_proj)
+
+    @torch.no_grad()
+    def prefetch_host_modulation(self, timesteps: torch.Tensor) -> None:
+        """Compute the host modulation of a whole schedule in one pass over the weights (no-op when disabled)."""
+        if self.host_modulation is None:
+            return
+        timesteps = timesteps.to(self.time_embedder.linear_1.weight.device)
+        self.host_modulation.prefetch(timesteps, self._time_embedding(timesteps))
 
     def forward(
         self,
@@ -511,8 +593,10 @@ class PAN2Transformer3DModel(nn.Module):
             rope_table = torch.cat((cos, sin), dim=-1)
         image_rotary_emb = (cos, sin, rope_table)
 
-        timesteps_proj = self.time_proj(timestep).to(self.time_embedder.linear_1.weight.dtype)
-        temb = self.time_embedder(timesteps_proj)
+        temb = self._time_embedding(timestep)
+        # Host modulation hands every block the same [B, num_blocks, 6 * dim] table (Cache-DiT's Pattern_0 passes
+        # one argument set to all blocks); each block selects its own row. norm_out keeps the plain ``temb``.
+        block_temb = temb if self.host_modulation is None else self.host_modulation.lookup(timestep, temb)
 
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
         for block in self.context_refiner:
@@ -521,7 +605,7 @@ class PAN2Transformer3DModel(nn.Module):
 
         for block in self.transformer_blocks:
             hidden_states, encoder_hidden_states = block(
-                hidden_states, encoder_hidden_states, temb, image_rotary_emb, hidden_states_mask
+                hidden_states, encoder_hidden_states, block_temb, image_rotary_emb, hidden_states_mask
             )
 
         hidden_states = self.norm_out(hidden_states.type_as(temb), temb).type_as(hidden_states)
@@ -546,7 +630,12 @@ class PAN2Transformer3DModel(nn.Module):
         params_dict = dict(self.named_parameters())
 
         loaded_params: set[str] = set()
+        skipped_modulation = 0
         for name, loaded_weight in weights:
+            if self.host_modulation is not None and is_host_modulation_weight(name):
+                # Served from the memory-mapped checkpoint by PAN2HostModulation; never placed on the accelerator.
+                skipped_modulation += 1
+                continue
             # The checkpoint keeps the diffusers ``to_out.0`` name of the attention output projections.
             name = name.replace(".to_out.0.", ".to_out.")
             if name.startswith("context_refiner."):
@@ -577,4 +666,6 @@ class PAN2Transformer3DModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
+        # load_weights may run once per shard group, so the total is tracked across calls.
+        self.host_modulation_skipped_weights = getattr(self, "host_modulation_skipped_weights", 0) + skipped_modulation
         return loaded_params
