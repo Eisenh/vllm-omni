@@ -289,7 +289,9 @@ class PAN2Attention(nn.Module):
         hidden_states, encoder_hidden_states = hidden_states.split_with_sizes(
             [hidden_states.shape[1] - encoder_hidden_states.shape[1], encoder_hidden_states.shape[1]], dim=1
         )
-        return self.to_out(hidden_states), self.to_add_out(encoder_hidden_states)
+        # At batch > 1 the token split is a strided view; quantized linears (e.g. the FP8 scaled-mm kernels) flatten
+        # their input with .view() and need it contiguous. A no-op at batch 1.
+        return self.to_out(hidden_states.contiguous()), self.to_add_out(encoder_hidden_states.contiguous())
 
 
 class PAN2TransformerBlock(nn.Module):
