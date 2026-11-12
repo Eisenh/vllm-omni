@@ -43,6 +43,7 @@ def random_checkpoint(root: Path) -> dict[str, torch.Tensor]:
     from vllm_omni.diffusion.models.pan2.pan2_transformer import PAN2Transformer3DModel
 
     od_config = OmniDiffusionConfig.from_kwargs(dtype=DTYPE)
+    od_config.model_config = {"pan2_host_modulation": False}
     ref = PAN2Transformer3DModel(od_config=od_config, **TINY)
     g = torch.Generator().manual_seed(0)
     state: dict[str, torch.Tensor] = {}
