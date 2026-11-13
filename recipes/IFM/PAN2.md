@@ -80,6 +80,10 @@ a request with HTTP 400. They need the `pan2-guardrail` package:
 pip install git+https://github.com/ifm-ai/pan2-guardrail
 ```
 
+By default the guardrails run on the accelerator. `guardrail_device: "cpu"`
+runs them on the CPU instead, for GPUs with no room for them next to the
+transformer.
+
 ## Hardware profiles
 
 Every profile is sized for the longest 481-frame, 704x1248 output. Peaks are
@@ -92,9 +96,14 @@ per GPU.
 | | 8 | `--cfg-parallel-size 2 --usp 4` | 110.4 GiB | This page |
 | 96 GB (RTX PRO 6000) | 1 | `--enable-distributed-layerwise-offload --dlo-resident-layers 48`, `offload_guardrail_models` | 84.4 GiB | [PAN2-RTX-PRO-6000](PAN2-RTX-PRO-6000.md) |
 | | 2 | `--tensor-parallel-size 2` | 84.5 GiB | [PAN2-RTX-PRO-6000](PAN2-RTX-PRO-6000.md) |
+| 24 GB (RTX 4090) | 2 | FP8 checkpoint, `--tensor-parallel-size 2 --enable-cpu-offload`, `guardrail_device: "cpu"` | 22.9 GiB (241 frames) | [PAN2-RTX-4090](PAN2-RTX-4090.md) |
 
-`offload_guardrail_models` is set with
+`offload_guardrail_models` and `guardrail_device` are set with
 `--stage-overrides '{"0": {"model_config": {"offload_guardrail_models": true}}}'`.
+The 24 GB profile is sized for 241 frames, and it relies on host modulation
+(`pan2_host_modulation`, on by default for GPUs this small), which computes the
+17.7 GB of FP32 adaLN modulation on the CPU instead of replicating it on every
+GPU.
 With `--enable-distributed-layerwise-offload`, the DiT blocks stay in pinned
 host memory and stream to the GPU each step, with `--dlo-resident-layers`
 leading blocks kept on the GPU. The offloaded weights live in pinned system RAM,
