@@ -228,6 +228,19 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         self._last_load_request: dict[str, object] | None = None
         self._force_canonical_load = False
 
+    @staticmethod
+    def _is_prequantized(quant_config: object, *, auto_detected: bool) -> bool:
+        """Whether the checkpoint already holds the quantized weights, so CPU offload can load them on the CPU.
+
+        A config that marks itself (any ``is_checkpoint_*_serialized`` flag: ModelOpt FP8/NVFP4, INT8,
+        MXFP4/MXFP8, torchao, ...) decides. One without a marker (GPTQ, AWQ, AutoRound INT, ...) is pre-quantized
+        when it was auto-detected from the checkpoint's config.json rather than requested for online use.
+        """
+        from vllm_omni.quantization.factory import quant_config_is_serialized
+
+        serialized = quant_config_is_serialized(quant_config)
+        return auto_detected if serialized is None else serialized
+
     def take_host_weight_plan(self) -> HostWeightPlan | None:
         """Transfer the loader-produced plan to the offload backend."""
         plan = self.host_weight_plan
@@ -750,12 +763,11 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # For online quantization, load on device so quantization can run on accelerator,
         # then move back to CPU afterward.
         offload_after_quant = False
+        # Device on which quant methods post-process loaded weights (repacking, scale layout, ...).
+        process_device: torch.device | None = None
         if load_device == "cpu" and self.quant_config is not None and device is not None:
-            quant_cfg = self.quant_config
-            is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
-                quant_cfg, "is_checkpoint_quantized", False
-            )
-            if not is_offline:
+            auto_detected = bool(getattr(self.od_config, "quantization_config_is_auto_detected", False))
+            if not self._is_prequantized(self.quant_config, auto_detected=auto_detected):
                 load_device = device.type
                 offload_after_quant = True
                 logger.info(
@@ -763,6 +775,9 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     load_device,
                 )
             else:
+                # Post-processing still runs on the accelerator, one layer at a time, as it would without
+                # offload: some methods repack weights with accelerator-only kernels (e.g. Marlin).
+                process_device = device
                 logger.info("Offline-quantized model with CPU offload, loading weights directly on CPU")
 
         target_device = torch.device(load_device)
@@ -933,7 +948,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                         else:
                             self.load_weights(model)
                     self._maybe_fuse_distilled_lora(model)
-                    self._process_weights_after_loading(model, target_device)
+                    self._process_weights_after_loading(model, process_device or target_device)
 
                 # A warm final-layout hit has already completed all
                 # byte-changing work through the restorer.  Shared runtime

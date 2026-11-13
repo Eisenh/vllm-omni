@@ -508,6 +508,37 @@ def _disk_marks_serialized(qc_kwargs: dict[str, Any], quant_config: object) -> b
     return False
 
 
+def quant_config_is_serialized(quant_config: object) -> bool | None:
+    """Whether ``quant_config`` marks its weights as already quantized in the checkpoint.
+
+    Like ``_disk_marks_serialized``, this follows the ``is_checkpoint_*_serialized`` naming convention (and
+    ``is_checkpoint_serialized``), so new quant methods don't require updating an explicit allowlist. AutoRound
+    MXFP checkpoints mark themselves with ``data_type="mx_fp"``.
+
+    Returns True or False when the config carries such a marker, and None when it carries none (formats such
+    as GPTQ or AWQ that only exist as quantized checkpoints); the caller then decides from where the config
+    came from. A per-component config is False if any component is, True if all are, and None otherwise.
+    """
+    components = getattr(quant_config, "_components", None)
+    if isinstance(quant_config, ComponentQuantizationConfig) and isinstance(components, Mapping):
+        routed = [c for c in (*components.values(), getattr(quant_config, "_default", None)) if c is not None]
+        marks = [quant_config_is_serialized(c) for c in routed]
+        if False in marks:
+            return False
+        return True if marks and all(marks) else None
+    if getattr(quant_config, "data_type", None) == "mx_fp":
+        return True
+    flags = [
+        getattr(quant_config, name, None)
+        for name in dir(quant_config)
+        if name == "is_checkpoint_serialized" or (name.startswith("is_checkpoint_") and name.endswith("_serialized"))
+    ]
+    flags = [flag for flag in flags if isinstance(flag, bool)]
+    if not flags:
+        return None
+    return any(flags)
+
+
 _MXFP4_SERIALIZED_FLAGS = {
     "mxfp4": "is_checkpoint_mxfp4_serialized",
     "mxfp4_dualscale": "is_checkpoint_serialized",
