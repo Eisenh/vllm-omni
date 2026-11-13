@@ -162,17 +162,20 @@ def _build_video_guardrail(checker: PAN2SafetyChecker, offload_to_cpu: bool) -> 
     return video_guardrail
 
 
-def _init_default_guardrails(offload_to_cpu: bool = False) -> None:
+def _init_default_guardrails(offload_to_cpu: bool = False, run_on_cpu: bool = False) -> None:
     global _text_guardrail, _video_guardrail
     if _text_guardrail is not None:
         return
     if _is_rank_zero():
-        logger.info("Initializing PAN 2 guardrails (offload_to_cpu=%s)...", offload_to_cpu)
+        logger.info("Initializing PAN 2 guardrails (offload_to_cpu=%s, run_on_cpu=%s)...", offload_to_cpu, run_on_cpu)
 
     # Raises ValueError when `pan2_guardrail` is not installed: the caller has opted in to guardrails.
     checker = PAN2SafetyChecker.from_pretrained()
-    # The checker loads on CPU. With offloading, each guard moves to the compute device only for its check.
-    if not offload_to_cpu:
+    # The checker loads on CPU. With run_on_cpu it stays there (GPUs too small to host the guards next to the DiT);
+    # with offloading, each guard moves to the compute device only for its check.
+    if run_on_cpu:
+        offload_to_cpu = False
+    elif not offload_to_cpu:
         checker.to(current_omni_platform.device_type)
 
     _text_guardrail = _build_text_guardrail(checker, offload_to_cpu)
@@ -185,7 +188,13 @@ def _ensure_guardrails_initialized(od_config: OmniDiffusionConfig) -> None:
     if not is_guardrails_enabled(od_config):
         return
     model_config = od_config.model_config or {}
-    _init_default_guardrails(offload_to_cpu=bool(model_config.get("offload_guardrail_models", False)))
+    guardrail_device = str(model_config.get("guardrail_device", "accelerator")).lower()
+    if guardrail_device not in ("accelerator", "cpu"):
+        raise ValueError(f"model_config.guardrail_device must be 'accelerator' or 'cpu', got {guardrail_device!r}")
+    _init_default_guardrails(
+        offload_to_cpu=bool(model_config.get("offload_guardrail_models", False)),
+        run_on_cpu=guardrail_device == "cpu",
+    )
 
 
 def _guardrails_not_initialized() -> RuntimeError:
