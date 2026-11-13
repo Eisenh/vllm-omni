@@ -1,3 +1,50 @@
+> [!NOTE]
+> **This is the Eisenhawer fork of vLLM-Omni, for running PAN 2 on 2x 24 GB GPUs (RTX 4090).**
+> The `pan2-host-modulation` branch adds four changes to upstream vLLM-Omni so that
+> [IFM/PAN2](https://huggingface.co/IFM/PAN2), a 29B video world model, fits on two 24 GB GPUs: host-side adaLN
+> modulation, pre-quantized checkpoints under CPU offload, CPU guardrails, and a joint-attention fix.
+> Use it with the ready-to-run FP8 checkpoint [Eisenhawer/PAN2-FP8](https://huggingface.co/Eisenhawer/PAN2-FP8).
+> Details, measurements and requirements (64 GB+ RAM, GPU peer-to-peer):
+> [recipes/IFM/PAN2-RTX-4090.md](recipes/IFM/PAN2-RTX-4090.md) and the model card.
+> The changes are proposed upstream; everything below this note is the upstream README.
+
+## PAN 2 on 2x 24 GB: quick start
+
+The setup script from the model card builds a separate Python environment (`~/.venvs/pan2-omni`) with vLLM 0.33.0
+and this branch, then serves the checkpoint. It does not touch an existing vLLM-Omni install.
+
+```bash
+hf download Eisenhawer/PAN2-FP8 --include 'recipe/*' --local-dir PAN2-FP8 && cd PAN2-FP8/recipe
+./pan2_serve.sh setup      # env: vLLM 0.33.0 + this branch
+./pan2_serve.sh serve      # downloads the 59 GB checkpoint on first run; picks the 2x24 / 1x48 / 2x48 GB profile
+./pan2_serve.sh generate --prompt-file examples/prompt.json --negative-file examples/negative_prompt.json \
+    --frames 121 --size 1248x704 --out swim.mp4
+```
+
+## Patching your own vLLM-Omni
+
+The branch is based on upstream `40b1153fe` and needs vLLM 0.33.0. Pick one of these:
+
+```bash
+# 1. Replace the vLLM-Omni in an existing environment (vLLM 0.33.0) with this branch:
+pip install "git+https://github.com/Eisenh/vllm-omni.git@pan2-host-modulation"
+
+# 2. Merge the changes into your own clone, then reinstall it:
+cd vllm-omni
+git remote add eisenh https://github.com/Eisenh/vllm-omni.git
+git fetch eisenh pan2-host-modulation
+git merge eisenh/pan2-host-modulation     # newer upstream may need conflict resolution
+pip install -e .
+
+# 3. Have the setup script build its environment from your patched clone:
+PAN2_VLLM_OMNI_SRC=/path/to/vllm-omni ./pan2_serve.sh setup
+```
+
+Then serve as in the recipe, or with `./pan2_serve.sh serve`. To check the patch is present:
+`python -c "from vllm_omni.diffusion.models.pan2 import host_modulation"`.
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/logos/vllm-omni-logo.png">
